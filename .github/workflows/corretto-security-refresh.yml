@@ -130,8 +130,6 @@ jobs:
             - Runtime Java version inspection in each image
 
             **Release control:** Merging this PR does not publish images. Use the existing approved release process to publish updated images, then roll them out to deployments. GitHub Actions PR checks created with the default GITHUB_TOKEN may not be triggered automatically; the refresh workflow runs the relevant tests before opening this PR.
-          labels: |
-            security
           add-paths: |
             docker/server/Dockerfile
             docker/standalone/Dockerfile

@@ -1,0 +1,136 @@
+name: Corretto base image security refresh
+
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: corretto-security-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Get upstream Corretto 25 manifest digest
+        id: corretto
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+          digest="$(skopeo inspect --format '{{.Digest}}' docker://docker.io/library/amazoncorretto:25)"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Upstream Corretto 25: $digest"
+
+      - name: Pin all Corretto runtime images to the upstream digest
+        id: update
+        env:
+          CORRETTO_DIGEST: ${{ steps.corretto.outputs.digest }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          digest = os.environ["CORRETTO_DIGEST"]
+          paths = (
+              "docker/server/Dockerfile",
+              "docker/standalone/Dockerfile",
+              "docker/canary/Dockerfile",
+          )
+          for name in paths:
+              path = pathlib.Path(name)
+              original = path.read_text()
+              updated, matches = re.subn(
+                  r"(?m)^(FROM amazoncorretto:25)(?:@sha256:[0-9a-f]{64})?(?=\s|$)",
+                  lambda match: match.group(1) + "@" + digest,
+                  original,
+              )
+              if matches != 1:
+                  raise SystemExit(f"Expected exactly one Corretto base in {name}, found {matches}")
+              path.write_text(updated)
+          PY
+          if git diff --quiet -- docker/server/Dockerfile docker/standalone/Dockerfile docker/canary/Dockerfile; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git diff --check
+            git diff -- docker/server/Dockerfile docker/standalone/Dockerfile docker/canary/Dockerfile
+          fi
+
+      - name: Set up Java 25
+        if: steps.update.outputs.changed == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: corretto
+          java-version: '25'
+
+      - name: Test and assemble LittleHorse server and canary
+        if: steps.update.outputs.changed == 'true'
+        run: ./gradlew server:test server:shadowJar server:installDist canary:test canary:installDist
+
+      - name: Set up Node.js 24
+        if: steps.update.outputs.changed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Set up pnpm
+        if: steps.update.outputs.changed == 'true'
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.19.0
+
+      - name: Build dashboard for standalone image
+        if: steps.update.outputs.changed == 'true'
+        working-directory: dashboard
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - name: Build and verify all Corretto-based images
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          for component in server standalone canary; do
+            docker build --pull \
+              --file "docker/$component/Dockerfile" \
+              --tag "lh-security-$component:verify" .
+            echo "$component Java version:"
+            docker run --rm --entrypoint java "lh-security-$component:verify" -version
+          done
+
+      - name: Open or update security refresh pull request
+        if: steps.update.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: security/corretto-25-base-refresh
+          delete-branch: true
+          title: 'security: refresh Corretto 25 container base digest'
+          commit-message: 'security: refresh Corretto 25 container base digest'
+          body: |
+            Automated weekly Corretto base-image refresh.
+
+            Updates the manifest-list digest in the server, standalone, and canary Dockerfiles.
+
+            Validation performed by the scheduled workflow:
+            - Gradle server and canary tests and distributions
+            - Standalone dashboard build
+            - Docker builds of all three Java-based images
+            - Runtime Java version inspection in each image
+
+            **Release control:** Merging this PR does not publish images. Use the existing approved release process to publish updated images, then roll them out to deployments. GitHub Actions PR checks created with the default GITHUB_TOKEN may not be triggered automatically; the refresh workflow runs the relevant tests before opening this PR.
+          add-paths: |
+            docker/server/Dockerfile
+            docker/standalone/Dockerfile
+            docker/canary/Dockerfile

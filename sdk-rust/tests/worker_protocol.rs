@@ -47,6 +47,11 @@ impl LittleHorse for TestServer {
                     result: Some(ScheduledTask {
                         attempt_number: 2,
                         total_observed_checkpoints: 1,
+                        variables: vec![VarNameAndVal {
+                            var_name: "name".into(),
+                            value: Some(to_value(&"Ada").unwrap()),
+                            ..Default::default()
+                        }],
                         ..Default::default()
                     }),
                 }))
@@ -117,6 +122,9 @@ async fn worker_streams_and_reports_results_with_authentication() {
             let calls = calls.clone();
             async move {
                 assert_eq!(context.task.attempt_number, 2);
+                assert_eq!(context.input_named::<String>("name")?, "Ada");
+                assert!(context.input_named::<String>("missing").is_err());
+                assert!(context.input_named::<i64>("name").is_err());
                 let replayed = context
                     .checkpoint(|| async { panic!("persisted checkpoint must not reexecute") })
                     .await?;

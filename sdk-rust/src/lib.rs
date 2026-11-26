@@ -19,7 +19,7 @@ pub use workflow::{Expression, Workflow, WorkflowError};
 
 extern crate self as littlehorse;
 pub mod types;
-pub use littlehorse_derive::LittleHorseValue;
+pub use littlehorse_derive::{LittleHorseValue, task};
 pub use types::{LittleHorseValue, StructSchema};
 
 pub mod auth;
@@ -35,3 +35,6 @@ pub mod ids;
 pub mod json;
 pub mod pagination;
 pub mod schema;
+
+/// RPC error returned when registering a macro-generated task.
+pub type TaskRegistrationError = tonic::Status;

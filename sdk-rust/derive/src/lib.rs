@@ -125,3 +125,121 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         }
     })
 }
+
+
+/// Generate a worker and TaskDef registration from an async Rust function.
+#[proc_macro_attribute]
+pub fn task(attribute: TokenStream, item: TokenStream) -> TokenStream {
+    let task_name = parse_macro_input!(attribute as syn::LitStr);
+    let function = parse_macro_input!(item as syn::ItemFn);
+    expand_task(task_name, function)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+fn expand_task(
+    task_name: syn::LitStr,
+    function: syn::ItemFn,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let signature = &function.sig;
+    let name = &signature.ident;
+    let visibility = &function.vis;
+    if signature.asyncness.is_none()
+        || !signature.generics.params.is_empty()
+        || signature.unsafety.is_some()
+        || signature.abi.is_some()
+        || signature.variadic.is_some()
+    {
+        return Err(syn::Error::new_spanned(
+            signature,
+            "task requires a non-generic, safe async Rust function",
+        ));
+    }
+    if task_name.value().is_empty() {
+        return Err(syn::Error::new_spanned(task_name, "task name cannot be empty"));
+    }
+    let syn::ReturnType::Type(_, return_type) = &signature.output else {
+        return Err(syn::Error::new_spanned(signature, "task must return Result<T, TaskFailure>"));
+    };
+    let syn::Type::Path(return_path) = return_type.as_ref() else {
+        return Err(syn::Error::new_spanned(return_type, "task must return Result<T, TaskFailure>"));
+    };
+    let result = return_path.path.segments.last().unwrap();
+    let syn::PathArguments::AngleBracketed(arguments) = &result.arguments else {
+        return Err(syn::Error::new_spanned(return_type, "task must return Result<T, TaskFailure>"));
+    };
+    let Some(syn::GenericArgument::Type(output)) = arguments.args.first() else {
+        return Err(syn::Error::new_spanned(return_type, "task must return Result<T, TaskFailure>"));
+    };
+    if result.ident != "Result" || arguments.args.len() != 2 {
+        return Err(syn::Error::new_spanned(return_type, "task must return Result<T, TaskFailure>"));
+    }
+    let mut inputs = Vec::new();
+    let mut definitions = Vec::new();
+    let mut dependencies = Vec::new();
+    let mut call_arguments = Vec::new();
+    let context = quote::format_ident!("__littlehorse_context", span = proc_macro2::Span::mixed_site());
+    for argument in &signature.inputs {
+        let syn::FnArg::Typed(argument) = argument else {
+            return Err(syn::Error::new_spanned(argument, "task cannot take self"));
+        };
+        let syn::Pat::Ident(pattern) = argument.pat.as_ref() else {
+            return Err(syn::Error::new_spanned(&argument.pat, "task parameters must be named identifiers"));
+        };
+        if pattern.by_ref.is_some() || pattern.subpat.is_some() {
+            return Err(syn::Error::new_spanned(pattern, "task parameters must be named identifiers"));
+        }
+        let parameter = &pattern.ident;
+        let ty = &argument.ty;
+        let wire_name = parameter.to_string().trim_start_matches("r#").to_owned();
+        inputs.push(quote! {
+            let #parameter: #ty = #context.input_named(#wire_name)?;
+        });
+        definitions.push(quote! {
+            ::littlehorse::proto::VariableDef {
+                name: #wire_name.into(),
+                type_def: Some(<#ty as ::littlehorse::LittleHorseValue>::type_definition()),
+                ..::core::default::Default::default()
+            }
+        });
+        dependencies.push(quote! {
+            definitions.extend(<#ty as ::littlehorse::LittleHorseValue>::registrations());
+        });
+        call_arguments.push(parameter);
+    }
+    Ok(quote! {
+        #function
+
+        #visibility mod #name {
+            #[allow(unused_imports)]
+            use super::*;
+
+            pub fn worker() -> ::littlehorse::worker::Worker {
+                ::littlehorse::worker::Worker::new(#task_name, |#context| async move {
+                    #(#inputs)*
+                    let output: #output = super::#name(#(#call_arguments),*).await?;
+                    ::littlehorse::LittleHorseValue::to_lh(&output)
+                        .map_err(|error| ::littlehorse::worker::TaskFailure::Output(error.to_string()))
+                })
+            }
+
+            pub async fn register(
+                client: &mut ::littlehorse::Client,
+            ) -> Result<::littlehorse::proto::TaskDef, ::littlehorse::TaskRegistrationError> {
+                let mut definitions = Vec::new();
+                #(#dependencies)*
+                definitions.extend(<#output as ::littlehorse::LittleHorseValue>::registrations());
+                worker().register_with_dependencies(
+                    client,
+                    vec![#(#definitions),*],
+                    if ::core::any::type_name::<#output>() == "()" {
+                        None
+                    } else {
+                        Some(<#output as ::littlehorse::LittleHorseValue>::type_definition())
+                    },
+                    definitions,
+                ).await
+            }
+        }
+    })
+}

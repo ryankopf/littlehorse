@@ -165,6 +165,28 @@ Generated clients expose every management/search/scheduling/admin/migration RPC.
 
 ## Workers
 
+Use named inputs with `context.input_named::<String>("email")?` instead of positional indexes.
+For ordinary async functions, the task attribute generates a worker and registration helper:
+
+```rust,no_run
+use littlehorse::{Client, worker::TaskFailure};
+
+#[littlehorse::task("send-email")]
+async fn send_email(email: String, subject: String, body: String) -> Result<String, TaskFailure> {
+    Ok(format!("{email}: {subject}: {body}"))
+}
+
+async fn register(client: &mut Client) -> Result<(), littlehorse::TaskRegistrationError> {
+    send_email::register(client).await?;
+    let _worker = send_email::worker();
+    Ok(())
+}
+```
+
+Parameter names become TaskDef input names; the workflow DSL remains unchanged:
+`wf.execute("send-email", (&email, &subject, &body))`.
+
+
 `Worker::new(task_name, async_handler)` supplies `TaskContext` for positional/native
 inputs, task/attempt/source IDs, stable idempotency keys, user-task ownership,
 logging, and checkpoints. `Worker::typed<I,O>` adapts typed one-argument handlers.
